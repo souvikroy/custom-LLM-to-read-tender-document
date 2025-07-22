@@ -1,31 +1,16 @@
-"""
-Open Source Tender Document Analyzer using Gemini (Google Generative AI)
------------------------------------------------------------------------
-- Accepts multiple PDF files as input.
-- Extracts information based on user-defined criteria using Gemini LLM (gemini-2.0-flash).
-- Outputs structured JSON with extracted information.
-
-Requirements:
-- Python 3.8+
-- google-generativeai (pip install google-generativeai)
-- PyPDF2 (pip install PyPDF2)
-- Set environment variable GEMINI_API_KEY with your Gemini API key.
-"""
-
-import os
-import sys
-import json
-from typing import List, Dict
+import streamlit as st
 import PyPDF2
-import google.generativeai as genai
+import json
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-# Criteria for extraction
+# Criteria schema (same as in infer_llm.py)
 CRITERIA = {
     "general_criteria": {
         "technical": [
             "technical qualification",
             "technical criteria",
             "technical requirement",
+            "similar work",
             "work experience",
             "project experience",
             "completion certificate",
@@ -77,13 +62,6 @@ CRITERIA = {
             "retention money",
             "defect liability",
             "completion period"
-        ],
-        "similar_work": [
-            "similar work",
-            "similar nature work",
-            "similar completed work",
-            "similar type of work",
-            "similar project"
         ]
     },
     "specific_criteria": {
@@ -156,33 +134,16 @@ CRITERIA = {
     }
 }
 
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extracts all text from a PDF file."""
+def extract_text_from_pdf(pdf_file):
     text = ""
-    with open(pdf_path, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        for page in reader.pages:
-            text += page.extract_text() or ""
+    reader = PyPDF2.PdfReader(pdf_file)
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
     return text
 
-def chunk_text(text: str, max_tokens: int = 2000) -> List[str]:
-    """Splits text into chunks suitable for LLM input."""
-    # Simple split by paragraphs, can be improved
-    paragraphs = text.split("\n\n")
-    chunks = []
-    current = ""
-    for para in paragraphs:
-        if len(current) + len(para) < max_tokens * 4:  # rough char/token estimate
-            current += para + "\n\n"
-        else:
-            chunks.append(current)
-            current = para + "\n\n"
-    if current:
-        chunks.append(current)
-    return chunks
-
-def build_prompt(chunk: str, criteria: Dict) -> str:
-    """Builds a prompt for the LLM to extract information based on criteria."""
+def build_prompt(text, criteria):
     return f"""
 You are an expert tender document analyst. Given the following text chunk from a tender document, extract all information relevant to the following criteria, grouping your findings under each heading. If nothing is found for a heading, write "Not found".
 
@@ -191,56 +152,50 @@ Criteria (JSON structure):
 
 Text chunk:
 \"\"\"
-{chunk}
+{text}
 \"\"\"
 
 Respond in JSON format matching the criteria structure.
 """
 
-def analyze_pdf_with_llm(pdf_path: str, criteria: Dict) -> Dict:
-    """Extracts information from a PDF using Gemini LLM."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable not set.")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    text = extract_text_from_pdf(pdf_path)
-    chunks = chunk_text(text)
-    results = []
-    for chunk in chunks:
-        prompt = build_prompt(chunk, criteria)
-        try:
-            response = model.generate_content(prompt)
-            content = response.text
-            data = json.loads(content)
-        except Exception as e:
-            data = {"error": f"Failed to parse LLM response: {e}", "raw": content if 'content' in locals() else ""}
-        results.append(data)
-    # Merge results (simple merge: last non-"Not found" wins)
-    merged = {}
-    def merge_dicts(a, b):
-        for k, v in b.items():
-            if isinstance(v, dict):
-                a[k] = merge_dicts(a.get(k, {}), v)
-            else:
-                if v != "Not found":
-                    a[k] = v
-        return a
-    for r in results:
-        merged = merge_dicts(merged, r)
-    return merged
+def flatten_dict(d, parent_key='', sep=' > '):
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep))
+        else:
+            items.append((new_key, v))
+    return items
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python main.py <pdf1> <pdf2> ...")
-        sys.exit(1)
-    pdf_files = sys.argv[1:]
-    all_results = {}
-    for pdf in pdf_files:
-        print(f"Analyzing {pdf} ...")
-        result = analyze_pdf_with_llm(pdf, CRITERIA)
-        all_results[os.path.basename(pdf)] = result
-    print(json.dumps(all_results, indent=2, ensure_ascii=False))
+st.title("Custom LLM Tender Document Extractor (Lightweight Model)")
 
-if __name__ == "__main__":
-    main()
+uploaded_file = st.file_uploader("Upload a Tender PDF", type=["pdf"])
+
+if uploaded_file is not None:
+    with st.spinner("Extracting text from PDF..."):
+        text = extract_text_from_pdf(uploaded_file)
+    st.success("Text extracted from PDF.")
+    st.text_area("Extracted Text", text, height=200)
+
+    if st.button("Run LLM Extraction"):
+        with st.spinner("Loading lightweight LLM and extracting..."):
+            model_name = "distilgpt2"  # Change to "TinyLlama/TinyLlama-1.1B-Chat-v1.0" if available
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+            nlp = pipeline("text-generation", model=model, tokenizer=tokenizer)
+
+            prompt = build_prompt(text, CRITERIA)
+            response = nlp(prompt, max_new_tokens=1024)[0]['generated_text']
+
+            # Try to parse JSON from response
+            try:
+                json_start = response.find("{")
+                json_data = json.loads(response[json_start:])
+                st.subheader("Extracted Information (JSON)")
+                st.json(json_data)
+                flat = flatten_dict(json_data)
+                st.subheader("Tabular View")
+                st.table(flat)
+            except Exception as e:
+                st.error(f"Could not parse JSON from LLM output. Raw output below:\n\n{response}")
